@@ -2,7 +2,11 @@ import { useState, FormEvent, useEffect, useRef } from "react";
 import { io, Socket } from "socket.io-client";
 import "./App.css";
 import { Message } from "./lib/types/Message";
-// import { ReadReceipt } from "./lib/types/ReadReceipt"; // Removed unused import
+import { UsernameForm } from "./lib/components/UsernameForm";
+import { ChatHeader } from "./lib/components/ChatHeader";
+import { OnlineUsers } from "./lib/components/OnlineUsers";
+import { MessageList } from "./lib/components/MessageList";
+import { MessageInput } from "./lib/components/MessageInput";
 
 /**
  * The main application component for the chat client.
@@ -33,91 +37,142 @@ const App = () => {
   /** State to temporarily store the old username when initiating a username change. */
   const [oldUsername, setOldUsername] = useState("");
 
+  // Refs to hold the latest state values for use in effect callbacks without adding to dependency array
+  const usernameRef = useRef(username);
+  const hasUsernameRef = useRef(hasUsername);
+
+  // Keep refs updated with the latest state
+  useEffect(() => {
+    usernameRef.current = username;
+    hasUsernameRef.current = hasUsername;
+  }, [username, hasUsername]);
+
   /**
    * Effect hook to establish and manage the Socket.IO connection.
    * Sets up listeners for incoming messages, user list updates, and connection events.
    * Cleans up the connection on component unmount.
-   * Dependency: `username` - Re-runs if username changes to potentially re-emit read receipts.
    */
   useEffect(() => {
     // Connect to the Socket.IO server
-    socketRef.current = io("http://localhost:3000");
+    // Ensure only one connection is made
+    if (!socketRef.current) {
+      console.log("Establishing socket connection...");
+      socketRef.current = io("http://localhost:3000");
 
-    /** Handler for incoming 'chat message' events. */
-    const handleChatMessage = (msg: Message) => {
-      setMessages((prevMessages) => {
-        // Prevent duplicates if the same message ID is received again
-        const messageExists = prevMessages.some((m) => m.id === msg.id);
-        if (messageExists) {
-          return prevMessages;
-        }
-        return [...prevMessages, msg];
-      });
-
-      // Automatically send a read receipt if the message is not from the current user
-      if (username && msg.sender !== username && socketRef.current) {
-        socketRef.current.emit("read receipt", {
-          messageId: msg.id,
-          reader: username
+      /** Handler for incoming 'chat message' events. */
+      const handleChatMessage = (msg: Message) => {
+        setMessages((prevMessages) => {
+          // Prevent duplicates if the same message ID is received again
+          const messageExists = prevMessages.some((m) => m.id === msg.id);
+          if (messageExists) {
+            console.warn(`Duplicate message received, ignoring: ${msg.id}`);
+            return prevMessages;
+          }
+          return [...prevMessages, msg];
         });
-      }
-    };
 
-    /** Handler for 'message updated' events (typically for read receipts). */
-    const handleMessageUpdated = (updatedMsg: Message) => {
-      setMessages((prevMessages) => prevMessages.map((msg) => (msg.id === updatedMsg.id ? updatedMsg : msg)));
-    };
+        // Automatically send a read receipt if the message is not from the current user and socket exists
+        // Use refs here to avoid adding state to dependency array
+        if (usernameRef.current && msg.sender !== usernameRef.current && socketRef.current) {
+          console.log(`Auto-sending read receipt for message ${msg.id} from ${usernameRef.current}`);
+          socketRef.current.emit("read receipt", {
+            messageId: msg.id,
+            reader: usernameRef.current
+          });
+        }
+      };
 
-    /** Handler for 'online users' events. */
-    const handleOnlineUsers = (users: string[]) => {
-      setOnlineUsers(users);
-    };
+      /** Handler for 'message updated' events (typically for read receipts). */
+      const handleMessageUpdated = (updatedMsg: Message) => {
+        console.log(`Updating message ${updatedMsg.id} based on 'message updated' event.`);
+        setMessages((prevMessages) => prevMessages.map((msg) => (msg.id === updatedMsg.id ? updatedMsg : msg)));
+      };
 
-    /** Handler for successful connection events. */
-    const handleConnect = () => {
-      console.log("Connected to server");
-      setConnectionError(null); // Clear any previous error
-    };
+      /** Handler for 'online users' events. */
+      const handleOnlineUsers = (users: string[]) => {
+        setOnlineUsers(users);
+      };
 
-    /** Handler for connection error events. */
-    const handleConnectError = (error: Error) => {
-      console.error("Connection error:", error);
-      setConnectionError(
-        `Failed to connect to the chat server. Please check your connection or try again later. Error: ${error.message}`
-      );
-    };
+      /** Handler for successful connection events. */
+      const handleConnect = () => {
+        console.log("Connected to server with socket ID:", socketRef.current?.id);
+        setConnectionError(null); // Clear any previous error
+        // If user was already "logged in" (e.g., reconnect after brief disconnect), rejoin
+        // Use refs here to avoid adding state to dependency array
+        if (hasUsernameRef.current && usernameRef.current) {
+          console.log(`Re-emitting 'user joined' for ${usernameRef.current} after reconnect.`);
+          socketRef.current?.emit("user joined", usernameRef.current);
+        }
+      };
 
-    // Register event listeners
-    socketRef.current.on("chat message", handleChatMessage);
-    socketRef.current.on("message updated", handleMessageUpdated);
-    socketRef.current.on("online users", handleOnlineUsers);
-    socketRef.current.on("connect", handleConnect);
-    socketRef.current.on("connect_error", handleConnectError);
+      /** Handler for connection error events. */
+      const handleConnectError = (error: Error) => {
+        console.error("Connection error:", error);
+        setConnectionError(
+          `Failed to connect to the chat server. Please check your connection or try again later. Error: ${error.message}`
+        );
+        // Optionally attempt to disconnect to prevent repeated errors if in a bad state
+        socketRef.current?.disconnect();
+        socketRef.current = null; // Allow reconnection attempt on next render cycle if needed
+      };
+
+      /** Handler for disconnect events */
+      const handleDisconnect = (reason: Socket.DisconnectReason) => {
+        console.log("Disconnected from server. Reason:", reason);
+        if (reason === "io server disconnect") {
+          // Server initiated disconnect, maybe handle differently?
+          setConnectionError("Disconnected by the server.");
+        } else if (reason === "io client disconnect") {
+          // Client initiated disconnect (e.g., logout), usually okay.
+        } else {
+          // Other reasons (transport error, ping timeout) might warrant an error message
+          setConnectionError("Lost connection to the server. Attempting to reconnect...");
+          // Socket.IO will attempt to reconnect automatically unless `autoConnect` is false
+        }
+        // Clear online users on disconnect as the list might be stale upon reconnect
+        setOnlineUsers([]);
+      };
+
+      // Register event listeners
+      socketRef.current.on("chat message", handleChatMessage);
+      socketRef.current.on("message updated", handleMessageUpdated);
+      socketRef.current.on("online users", handleOnlineUsers);
+      socketRef.current.on("connect", handleConnect);
+      socketRef.current.on("connect_error", handleConnectError);
+      socketRef.current.on("disconnect", handleDisconnect);
+    }
 
     // Cleanup function: remove listeners and disconnect socket
     return () => {
       if (socketRef.current) {
-        socketRef.current.off("chat message", handleChatMessage);
-        socketRef.current.off("message updated", handleMessageUpdated);
-        socketRef.current.off("online users", handleOnlineUsers);
-        socketRef.current.off("connect", handleConnect);
-        socketRef.current.off("connect_error", handleConnectError);
+        console.log("Cleaning up socket listeners and disconnecting...");
+        socketRef.current.off("chat message");
+        socketRef.current.off("message updated");
+        socketRef.current.off("online users");
+        socketRef.current.off("connect");
+        socketRef.current.off("connect_error");
+        socketRef.current.off("disconnect");
+        // Only disconnect if the component is truly unmounting,
+        // not just on username change if we want connection persistence.
+        // However, the current logout logic handles explicit disconnect.
+        // Let's keep the disconnect here for robustness on unmount.
         socketRef.current.disconnect();
-        console.log("Socket disconnected on cleanup");
+        socketRef.current = null;
+        console.log("Socket disconnected and instance nulled on cleanup.");
       }
     };
-    // Re-run this effect if the username changes, which might be relevant for read receipts
-    // or potential future logic tied to the specific user.
-  }, [username]);
+    // Only run on mount and unmount (empty dependency array)
+    // Username changes are handled by other effects.
+  }, []);
 
   /**
    * Effect hook to emit "user joined" or "change username" events when the username state changes
-   * after the user has initially joined (hasUsername is true).
+   * after the user has initially joined (hasUsername is true), or when hasUsername becomes true.
    * Dependencies: `username`, `hasUsername`, `changingUsername`, `oldUsername`
    */
   useEffect(() => {
     // Only proceed if we have a valid socket connection, a username, and the user has passed the initial join screen
-    if (username && hasUsername && socketRef.current) {
+    if (username && hasUsername && socketRef.current?.connected) {
       const trimmedUsername = username.trim();
 
       // If currently in the username change flow AND the name is different from the old one
@@ -130,6 +185,7 @@ const App = () => {
         });
         // Reset the changing username flag after emitting
         setChangingUsername(false);
+        setOldUsername(""); // Clear old username after successful change emission
       } else if (!changingUsername) {
         // If not changing username, emit the standard "user joined" event
         // This handles the initial join after setting the username.
@@ -142,7 +198,7 @@ const App = () => {
   /**
    * Effect hook to handle marking messages as read when the browser tab becomes visible.
    * Adds and removes a visibilitychange event listener.
-   * Dependencies: `messages`, `username`
+   * Dependencies: `username`
    */
   useEffect(() => {
     /**
@@ -150,18 +206,22 @@ const App = () => {
      * Sends read receipts for unread messages when the tab becomes visible.
      */
     const handleVisibilityChange = () => {
-      // Check if the tab is now visible and the user is logged in
-      if (document.visibilityState === "visible" && username && socketRef.current) {
+      // Check if the tab is now visible and the user is logged in and socket is connected
+      if (document.visibilityState === "visible" && username && socketRef.current?.connected) {
         console.log("Tab became visible, checking for unread messages.");
-        messages.forEach((msg) => {
-          // Send read receipt for messages not sent by the current user and not already marked as read by them
-          if (msg.sender !== username && !msg.readBy.includes(username)) {
-            console.log(`Sending read receipt for message ${msg.id} on visibility change.`);
-            socketRef.current?.emit("read receipt", {
-              messageId: msg.id,
-              reader: username
-            });
-          }
+        // Access the latest messages state directly inside the handler
+        setMessages((currentMessages) => {
+          currentMessages.forEach((msg) => {
+            // Send read receipt for messages not sent by the current user and not already marked as read by them
+            if (msg.sender !== username && !msg.readBy.includes(username)) {
+              console.log(`Sending read receipt for message ${msg.id} on visibility change.`);
+              socketRef.current?.emit("read receipt", {
+                messageId: msg.id,
+                reader: username
+              });
+            }
+          });
+          return currentMessages; // No state change needed here, just iterating
         });
       }
     };
@@ -171,7 +231,7 @@ const App = () => {
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [messages, username]);
+  }, [username]);
 
   /**
    * Effect hook to set up an IntersectionObserver for marking messages as read when they scroll into view.
@@ -179,8 +239,8 @@ const App = () => {
    * Dependencies: `messages.length`, `username`, `messages` (array reference itself)
    */
   useEffect(() => {
-    // Ensure the container ref is set, user is logged in, and there are messages to observe
-    if (!messagesContainerRef.current || !username || messages.length === 0) {
+    // Ensure the container ref is set, user is logged in, socket connected, and there are messages
+    if (!messagesContainerRef.current || !username || messages.length === 0 || !socketRef.current?.connected) {
       return;
     }
 
@@ -193,32 +253,30 @@ const App = () => {
      * @param {IntersectionObserverEntry[]} entries - Array of observer entries.
      */
     const observerCallback: IntersectionObserverCallback = (entries) => {
-      entries.forEach((entry) => {
-        // Check if the element is intersecting (visible)
-        if (entry.isIntersecting) {
-          const targetElement = entry.target as HTMLElement;
-          const messageId = targetElement.getAttribute("data-message-id");
-          if (!messageId) return; // Skip if the element doesn't have the message ID
+      // Use setMessages to ensure we're checking against the *latest* state
+      setMessages((currentMessages) => {
+        // let stateChanged = false; // Flag to see if we need to return a new array (for optimistic updates)
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            const targetElement = entry.target as HTMLElement;
+            const messageId = targetElement.getAttribute("data-message-id");
+            if (!messageId) return;
 
-          // Find the corresponding message in the *current* state
-          // Use a function call to get the latest messages state if necessary, although
-          // having messages in the dependency array should keep it up-to-date.
-          const message = messages.find((m) => m.id === messageId);
+            const message = currentMessages.find((m) => m.id === messageId);
 
-          // Send read receipt if the message exists, wasn't sent by the current user,
-          // and hasn't already been marked as read by the current user.
-          if (message && message.sender !== username && !message.readBy.includes(username) && socketRef.current) {
-            // Double-check the latest state in case it was updated between finding and emitting
-            const currentMessageState = messages.find((m) => m.id === messageId);
-            if (currentMessageState && !currentMessageState.readBy.includes(username)) {
+            if (message && message.sender !== username && !message.readBy.includes(username)) {
               console.log(`IntersectionObserver: Marking message ${messageId} as read by ${username}`);
-              socketRef.current.emit("read receipt", {
+              socketRef.current?.emit("read receipt", {
                 messageId,
                 reader: username
               });
+              // It's better to wait for the 'message updated' event to update state,
+              // rather than optimistically updating here, to avoid potential inconsistencies.
             }
           }
-        }
+        });
+        // If doing optimistic updates, return the modified array or original if no changes
+        return currentMessages; // For non-optimistic, just return the current state
       });
     };
 
@@ -243,8 +301,7 @@ const App = () => {
       }
       observer.disconnect();
     };
-    // Dependencies ensure the effect re-runs if the number of messages changes,
-    // the username changes, or the message array reference itself changes.
+    // Re-run observer setup if username changes or messages array/length changes
   }, [messages.length, username, messages]);
 
   /**
@@ -263,11 +320,11 @@ const App = () => {
    * Clears the input field after sending.
    * @param {FormEvent<HTMLFormElement>} e - The form submission event.
    */
-  const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
+  const handleMessageSubmit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault(); // Prevent page reload
     const trimmedInput = input.trim();
-    // Check if input is not empty and the user is logged in
-    if (trimmedInput && hasUsername && socketRef.current) {
+    // Check if input is not empty, user is logged in, and socket is connected
+    if (trimmedInput && hasUsername && socketRef.current?.connected) {
       console.log(`Sending message: "${trimmedInput}" from ${username}`);
       // Emit the message content and sender username
       socketRef.current.emit("chat message", {
@@ -276,6 +333,9 @@ const App = () => {
       });
       // Clear the input field
       setInput("");
+    } else if (!socketRef.current?.connected) {
+      console.warn("Cannot send message: Socket not connected.");
+      setConnectionError("Not connected. Cannot send message."); // Provide feedback
     }
   };
 
@@ -292,17 +352,33 @@ const App = () => {
 
     // Proceed only if a non-empty username is entered
     if (trimmedUsername) {
+      if (!socketRef.current) {
+        console.error("Socket not initialized. Attempting to initialize...");
+        // Attempt to initialize here, though ideally it should be ready from the initial useEffect
+        socketRef.current = io("http://localhost:3000");
+        // Add essential listeners again or rely on the main useEffect cleanup/re-run?
+        // For simplicity, let's show an error and ask to retry/reload
+        setConnectionError("Connection not ready. Please try again or reload.");
+        return;
+      }
+
       if (changingUsername) {
         // If we are in the 'change username' flow, call the specific update handler
         console.log(`Username form submitted in 'change' mode for: ${trimmedUsername}`);
         handleUsernameUpdate(trimmedUsername);
       } else {
-        // If it's the initial join, just set the flag
+        // If it's the initial join, set the flag
         console.log(`Username form submitted in 'join' mode for: ${trimmedUsername}`);
-        // Setting hasUsername to true triggers the useEffect hook
-        // which then emits the appropriate "user joined" event.
         setHasUsername(true);
+        // Ensure connection if not already established (e.g., if user was fast)
+        if (!socketRef.current.connected) {
+          console.log("Connecting socket on initial join submit...");
+          socketRef.current.connect();
+        }
       }
+    } else if (!trimmedUsername) {
+      // Handle empty username input if needed (e.g., show validation message)
+      console.log("Username cannot be empty.");
     }
   };
 
@@ -319,25 +395,32 @@ const App = () => {
       console.log("Username unchanged, returning to chat view.");
       setChangingUsername(false); // Exit the changing username mode
       setHasUsername(true); // Show the chat interface again
-    } else {
-      // If the username is different, proceed with the update
+      setOldUsername(""); // Clear old username
+    } else if (socketRef.current?.connected) {
+      // If the username is different and socket connected, proceed with the update
       console.log(`Attempting to update username state from ${oldUsername} to ${newUsername}`);
       // Update the username state. This will trigger the useEffect hook
       // which handles emitting the "change username" event because changingUsername is true.
       setUsername(newUsername);
       // Set hasUsername back to true to show the chat view after the state update triggers the effect.
       setHasUsername(true);
-      // Note: setChangingUsername(false) is handled within the useEffect hook after the event is emitted.
+      // Note: setChangingUsername(false) and setOldUsername("") are handled within the useEffect hook after the event is emitted.
+    } else {
+      console.warn("Cannot change username: Socket not connected.");
+      setConnectionError("Not connected. Cannot change username."); // Provide feedback
+      // Optionally revert UI state
+      setChangingUsername(false);
+      setHasUsername(true); // Go back to chat view with old username
     }
   };
 
   /**
    * Initiates the username change process.
    * Stores the current username, sets the `changingUsername` flag,
-   * hides the chat view, and clears the messages.
+   * hides the chat view, and potentially clears messages (optional).
    */
   const handleChangeUsername = () => {
-    if (socketRef.current) {
+    if (socketRef.current?.connected) {
       console.log(`Initiating username change for ${username}`);
       // Store the current username to compare against the new one later
       setOldUsername(username);
@@ -345,35 +428,37 @@ const App = () => {
       setChangingUsername(true);
       // Hide the main chat interface and show the username input form
       setHasUsername(false);
-      // Clear existing messages from the display
-      setMessages([]);
+      // Optionally clear messages, or keep them for context upon return?
+      // setMessages([]); // Uncomment to clear messages during name change
+    } else {
+      console.warn("Cannot initiate username change: Socket not connected.");
+      setConnectionError("Not connected. Cannot change username.");
     }
   };
 
   /**
    * Handles a complete logout.
-   * Disconnects the socket, resets all relevant state variables,
-   * and re-initializes the socket connection for a potential future login.
+   * Disconnects the socket, resets all relevant state variables.
    */
   const handleTrueLogout = () => {
     if (socketRef.current) {
       console.log(`Logging out user ${username}`);
       // Disconnect the current socket connection
       socketRef.current.disconnect();
+      socketRef.current = null; // Nullify the ref
 
       // Reset all application state to initial values
       setHasUsername(false);
       setMessages([]);
-      setUsername("");
+      setUsername(""); // Clear username field for next login
       setOnlineUsers([]);
       setChangingUsername(false);
       setOldUsername("");
       setConnectionError(null); // Also clear connection errors on logout
 
-      // Re-establish a clean socket instance for the next connection attempt
-      // Listeners will be added by the main useEffect hook when the component re-renders.
-      socketRef.current = io("http://localhost:3000");
-      console.log("State reset and new socket instance created after logout.");
+      console.log("State reset and socket instance nulled after logout.");
+      // The main useEffect will handle creating a new socket instance if the component remains mounted
+      // or on next mount.
     }
   };
 
@@ -392,158 +477,63 @@ const App = () => {
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   };
 
-  /**
-   * Renders the read receipt status for a given message.
-   * Shows "Not read yet" or "Read by X people" with a tooltip listing readers.
-   * Returns null for system messages.
-   * @param {Message} message - The message object to render receipts for.
-   */
-  const renderReadReceipts = (message: Message) => {
-    // Don't show read receipts for system messages
-    if (message.sender === "System") return null;
-
-    // Filter out the sender themselves from the readBy list for the display
-    const otherReaders = message.readBy.filter((reader) => reader !== message.sender);
-
-    // If no one else has read it yet
-    if (otherReaders.length === 0) {
-      return <div className="read-receipt">Not read yet</div>;
-    }
-
-    // Display count and list readers in a tooltip
-    return (
-      <div className="read-receipt">
-        Read by {otherReaders.length} {otherReaders.length === 1 ? "person" : "people"}
-        {/* Tooltip shown on hover */}
-        <div className="read-tooltip">
-          {otherReaders.map((reader) => (
-            <div key={reader} className="reader">
-              {reader}
-            </div>
-          ))}
-        </div>
-      </div>
-    );
-  };
-
   // Conditional Rendering Logic:
 
-  // 1. Render connection error view if connection failed
-  if (connectionError) {
+  // 1. Render connection error view if connection failed AND user is not logged in/changing name
+  if (connectionError && !hasUsername && !changingUsername) {
     return (
       <div className="error-container">
         <h1>Connection Error</h1>
         <p>{connectionError}</p>
-        {/* Consider adding a button here to manually trigger a reconnect attempt */}
+        <button onClick={() => window.location.reload()}>Reload</button>
+        {/* You could add a button to manually trigger socketRef.current?.connect() */}
       </div>
     );
   }
 
-  // 2. Render username input view if user hasn't joined yet
+  // 2. Render username input view if user hasn't joined yet or is changing username
   if (!hasUsername) {
-    // Determine title and button text based on whether it's initial join or changing username
-    const isChangingUsername = changingUsername;
-
     return (
-      <div className="username-container">
-        <h1>{isChangingUsername ? "Change Username" : "Join the Chat"}</h1>
-        <form onSubmit={handleUsernameSubmit}>
-          <input
-            value={username} // Controlled input
-            onChange={(e) => setUsername(e.target.value)} // Update state on change
-            placeholder="Enter your username"
-            aria-label="Username"
-            autoFocus // Focus input on load
-          />
-          {/* Disable button if username is empty or only whitespace */}
-          <button type="submit" disabled={username.trim() === ""}>
-            {isChangingUsername ? "Update" : "Join"}
-          </button>
-        </form>
-      </div>
+      <UsernameForm
+        username={username}
+        setUsername={setUsername}
+        onSubmit={handleUsernameSubmit}
+        isChanging={changingUsername}
+      />
     );
   }
 
   // 3. Render the main chat view if connected and username is set
   return (
     <div className="chat-container">
-      {/* Header Section */}
-      <header>
-        <h2>Chat Room</h2>
-        <div className="header-controls">
-          {/* Display current username */}
-          <div className="user-badge">
-            Logged in as <span>{username}</span>
-          </div>
-          {/* Button to initiate username change */}
-          <button className="change-username-button" onClick={handleChangeUsername}>
-            Change Username
-          </button>
-          {/* Button for complete logout */}
-          <button className="true-logout-button" onClick={handleTrueLogout}>
-            Logout
-          </button>
-        </div>
-      </header>
+      <ChatHeader username={username} onChangeUsername={handleChangeUsername} onLogout={handleTrueLogout} />
 
-      {/* Online Users Bar */}
-      <div className="online-users">
-        <div className="online-label">Online:</div>
-        <div className="user-list">
-          {onlineUsers.map((user) => (
-            <div key={user} className="online-user">
-              <span className="online-dot"></span> {user}
-            </div>
-          ))}
-        </div>
-      </div>
+      <OnlineUsers users={onlineUsers} />
 
-      {/* Messages Display Area */}
-      <div className="messages-container" ref={messagesContainerRef}>
-        {/* Sort messages chronologically before mapping */}
-        {[...messages]
-          .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-          .map((message) => (
-            <div
-              key={message.id} // Unique key for React rendering
-              // Apply CSS classes based on sender for styling
-              className={`message-bubble ${
-                message.sender === username ? "own-message" : ""
-              } ${message.sender === "System" ? "system-message" : ""}`}
-              data-message-id={message.id} // Store message ID for IntersectionObserver
-            >
-              {/* Message Header (Sender & Time) */}
-              <div className="message-header">
-                <span className="message-sender">{message.sender}</span>
-                <span className="message-time">{formatTime(message.timestamp)}</span>
-              </div>
-              {/* Message Content */}
-              <div className="message-content">{message.text}</div>
-              {/* Render Read Receipts */}
-              {renderReadReceipts(message)}
-            </div>
-          ))}
-        {/* Empty div target for scrolling to bottom */}
-        <div ref={messagesEndRef} />
-      </div>
-
-      {/* Message Input Form */}
-      <form id="form" onSubmit={handleSubmit}>
-        <div className="input-container">
-          <input
-            id="input"
-            value={input} // Controlled input
-            onChange={(e) => setInput(e.target.value)} // Update state on change
-            autoComplete="off" // Disable browser autocomplete
-            aria-label="Message input"
-            placeholder="Type a message..."
-          />
-          {/* Disable button if input is empty or only whitespace */}
-          <button type="submit" disabled={input.trim() === ""}>
-            Send
-          </button>
+      {/* Display connection error inline if occurs while logged in */}
+      {connectionError && (
+        <div
+          className="inline-error"
+          style={{ padding: "0.5rem 2rem", backgroundColor: "#5e3a3a", color: "white", textAlign: "center" }}
+        >
+          Warning: {connectionError}
         </div>
-      </form>
+      )}
+
+      <MessageList
+        messages={messages}
+        currentUser={username}
+        containerRef={messagesContainerRef}
+        endRef={messagesEndRef}
+        formatTime={formatTime}
+      />
+
+      <MessageInput
+        input={input}
+        setInput={setInput}
+        onSubmit={handleMessageSubmit}
+        disabled={!socketRef.current?.connected} // Disable input if not connected
+      />
     </div>
   );
 };
