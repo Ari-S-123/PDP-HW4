@@ -2,6 +2,14 @@
 
 A simple chat room app built with React, Vite, Express, and Socket.io.
 
+Creative Addition(s): Read receipts, online user(s) indicator, username changing
+
+## Possible Future Additions
+
+- Typing indicator
+- User account management with profile pictures
+- Message persistence
+
 ## Screenshot
 
 ![image](https://github.com/user-attachments/assets/77aca584-d36b-4615-b64f-6f2996be9761)
