@@ -2,6 +2,10 @@
 
 A simple chat room app built with React, Vite, Express, and Socket.io.
 
+## Screenshot
+
+![image](https://github.com/user-attachments/assets/77aca584-d36b-4615-b64f-6f2996be9761)
+
 ## Setup
 
 1. Clone the repository.
