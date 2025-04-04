@@ -48,7 +48,7 @@ To create and run a production version of the app:
 
 ## Video
 
-Refer to this [TODO](https://youtube.com) for a demo of the app.
+Refer to this [video](https://youtu.be/NrmTI772eQM) for a demo of the app.
 
 ## AI Usage
 
